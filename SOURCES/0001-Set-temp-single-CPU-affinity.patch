@@ -1,0 +1,476 @@
+From 00b21903d5c44c0b5220ca95375f675a2a08891a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?C=C3=A9dric=20Clerget?= <cedric.clerget@gmail.com>
+Date: Fri, 30 Jun 2023 15:49:47 +0200
+Subject: [PATCH] Set temporary single CPU affinity before cgroup cpuset
+ transition.
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+This handles a corner case when joining a container having all
+the processes running exclusively on isolated CPU cores to force
+the kernel to schedule runc process on the first CPU core within the
+cgroups cpuset.
+
+The introduction of the kernel commit
+46a87b3851f0d6eb05e6d83d5c5a30df0eca8f76 has affected this deterministic
+scheduling behavior by distributing tasks across CPU cores within the
+cgroups cpuset. Some intensive real-time application are relying on this
+deterministic behavior and use the first CPU core to run a slow thread
+while other CPU cores are fully used by real-time threads with SCHED_FIFO
+policy. Such applications prevents runc process from joining a container
+when the runc process is randomly scheduled on a CPU core owned by a
+real-time thread.
+
+This patch has been adapted to runc-1.1.8 by Skip Grube and Matt Hink (sgrube@ciq.com , mhink@ciq.com)
+
+Signed-off-by: Cédric Clerget <cedric.clerget@gmail.com>
+---
+ libcontainer/container_linux.go      | 136 ++++++++++++++++++++++
+ libcontainer/container_linux_test.go | 168 +++++++++++++++++++++++++++
+ libcontainer/message_linux.go        |   1 +
+ libcontainer/nsenter/nsexec.c        |  35 +++++-
+ 4 files changed, 338 insertions(+), 2 deletions(-)
+
+diff --git a/libcontainer/container_linux.go b/libcontainer/container_linux.go
+index 5f1a494b..059c3d79 100644
+--- a/libcontainer/container_linux.go
++++ b/libcontainer/container_linux.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"net"
+ 	"os"
+ 	"os/exec"
+@@ -27,6 +28,7 @@ import (
+ 	"google.golang.org/protobuf/proto"
+ 
+ 	"github.com/opencontainers/runc/libcontainer/cgroups"
++	"github.com/opencontainers/runc/libcontainer/cgroups/systemd"
+ 	"github.com/opencontainers/runc/libcontainer/configs"
+ 	"github.com/opencontainers/runc/libcontainer/intelrdt"
+ 	"github.com/opencontainers/runc/libcontainer/system"
+@@ -2238,6 +2240,24 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
+ 		})
+ 	}
+ 
++	// set CPU affinity
++	if it == initSetns && len(c.cgroupManager.GetPaths()) > 0 {
++		// get the target container cgroup
++		if cg, err := c.cgroupManager.GetCgroups(); err != nil {
++			return nil, fmt.Errorf("getting container cgroups: %w", err)
++		} else if cg.CpusetCpus != "" {
++			err := setCPUAffinity(os.DirFS("/"), cg.CpusetCpus, func(cpu uint32) {
++				r.AddData(&Int32msg{
++					Type:  CPUAffinityAttr,
++					Value: cpu,
++				})
++			})
++			if err != nil {
++				return nil, fmt.Errorf("setting CPU affinity: %w", err)
++			}
++		}
++	}
++
+ 	return bytes.NewReader(r.Serialize()), nil
+ }
+ 
+@@ -2272,3 +2292,119 @@ func requiresRootOrMappingTool(c *configs.Config) bool {
+ 	}
+ 	return !reflect.DeepEqual(c.GidMappings, gidMap)
+ }
++
++// setCPUAffinity adjusts the CPU affinity if necessary based on heuristics.
++func setCPUAffinity(fsys fs.FS, cpusetList string, setFn func(uint32)) error {
++	schedRuntimeData, err := fs.ReadFile(fsys, "proc/sys/kernel/sched_rt_runtime_us")
++	if err != nil || len(schedRuntimeData) == 0 {
++		return nil
++	}
++	schedRuntime, err := strconv.ParseInt(string(bytes.TrimSpace(schedRuntimeData)), 10, 64)
++	if err != nil {
++		return err
++	}
++
++	// When set to -1, it gives zero room for kernel to switch in kernel space on
++	// a CPU where a real-time application is running on under scheduler real-time
++	// policies and do not make any context switch.
++	// With this setting value and because the kernel randomly dispatch runc process
++	// on one of CPUs, runc can get stuck under some conditions during cgroup
++	// transition when many tasks within a cgroup cpuset are running under a scheduler
++	// real-time policy and on isolated CPUs.
++	// The call to getEligibleCPU below returns a predictable CPU affinity to circumvent
++	// this kernel random dispatching when isolated CPUs are present in the cpuset.
++	if schedRuntime != -1 {
++		return nil
++	}
++
++	// get the isolated CPU list
++	isolatedData, err := fs.ReadFile(fsys, "sys/devices/system/cpu/isolated")
++	// The above file may not be available in some environment
++	// due to /sys not being mounted, if not present we don't
++	// try to set CPU affinity and ignore the error.
++	// When an empty set is returned, the data length is equal
++	// to 1 (newline char), when set its length is greater than 1
++	// which means we may need to adjust CPU affinity shortly.
++	if err != nil || len(isolatedData) == 0 {
++		return nil
++	}
++
++	cpu, err := getEligibleCPU(cpusetList, string(bytes.TrimSpace(isolatedData)))
++	if err != nil {
++		return fmt.Errorf("getting eligible cpu: %w", err)
++	} else if cpu >= 0 && setFn != nil {
++		setFn(uint32(cpu))
++	}
++
++	return nil
++}
++
++// getEligibleCPU returns the first eligible CPU for CPU affinity before
++// entering in a cgroup cpuset:
++//   - when there is not cpuset cores: no eligible CPU (-1)
++//   - when there is not isolated cores: no eligible CPU (-1)
++//   - when cpuset cores are not in isolated cores: no eligible CPU (-1)
++//   - when cpuset cores are all isolated cores: return the first CPU of the cpuset
++//   - when cpuset cores are mixed between housekeeping/isolated cores: return the
++//     first housekeeping CPU not in isolated CPUs.
++func getEligibleCPU(cpusetList, isolatedList string) (int, error) {
++	if isolatedList == "" || cpusetList == "" {
++		return -1, nil
++	}
++
++	// The target container has a cgroup cpuset, get the bit range.
++	cpusetBits, err := systemd.RangeToBits(cpusetList)
++	if err != nil {
++		return -1, fmt.Errorf("parsing cpuset cpus list %s: %w", cpusetList, err)
++	}
++
++	isolatedBits, err := systemd.RangeToBits(isolatedList)
++	if err != nil {
++		return -1, fmt.Errorf("parsing isolated cpus list %s: %w", isolatedList, err)
++	}
++
++	eligibleCore := -1
++	isolatedCores := 0
++
++	// start from cpu core #0
++	currentCore := 0
++	// handle mixed sets
++	mixed := false
++
++	// CPU core start from the first slice element and bits are read
++	// from the least to the most significant bit.
++	for byteRange := 0; byteRange < len(cpusetBits); byteRange++ {
++		if byteRange >= len(isolatedBits) {
++			// no more isolated cores
++			break
++		}
++		for bit := 0; bit < 8; bit++ {
++			if cpusetBits[byteRange]&(1<<bit) != 0 {
++				// mark the first core of the cgroup cpuset as eligible
++				if eligibleCore < 0 {
++					eligibleCore = currentCore
++				}
++
++				// isolated cores count
++				if isolatedBits[byteRange]&(1<<bit) != 0 {
++					isolatedCores++
++				} else if !mixed {
++					// not an isolated core, mark the current core as eligible once
++					mixed = true
++					eligibleCore = currentCore
++				}
++				if mixed && isolatedCores > 0 {
++					return eligibleCore, nil
++				}
++			}
++			currentCore++
++		}
++	}
++
++	// we have an eligible CPU if there is at least one isolated CPU in the cpuset
++	if isolatedCores == 0 {
++		return -1, nil
++	}
++
++	return eligibleCore, nil
++}
+diff --git a/libcontainer/container_linux_test.go b/libcontainer/container_linux_test.go
+index 3eb6e5af..8ede3795 100644
+--- a/libcontainer/container_linux_test.go
++++ b/libcontainer/container_linux_test.go
+@@ -2,8 +2,10 @@ package libcontainer
+ 
+ import (
+ 	"fmt"
++	"io/fs"
+ 	"os"
+ 	"testing"
++	"testing/fstest"
+ 
+ 	"github.com/opencontainers/runc/libcontainer/cgroups"
+ 	"github.com/opencontainers/runc/libcontainer/configs"
+@@ -390,3 +392,169 @@ func TestGetContainerStateAfterUpdate(t *testing.T) {
+ 		t.Fatalf("expected Memory to be 2048 but received %q", state.Config.Cgroups.Memory)
+ 	}
+ }
++
++func TestSetCPUAffinity(t *testing.T) {
++	noAffinity := -1
++
++	tests := []struct {
++		name                 string
++		testFS               fs.FS
++		cpuset               string
++		expectedErr          bool
++		expectedAffinityCore int
++	}{
++		{
++			name:   "no affinity",
++			cpuset: "0-15",
++			testFS: fstest.MapFS{
++				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("950000\n")},
++				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("0-4\n")},
++			},
++			expectedAffinityCore: noAffinity,
++		},
++		{
++			name:   "affinity match",
++			cpuset: "3-4",
++			testFS: fstest.MapFS{
++				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("-1\n")},
++				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("0-4\n")},
++			},
++			expectedAffinityCore: 3,
++		},
++		{
++			name:   "no affinity with bad sched_rt_runtime_us",
++			cpuset: "0-15",
++			testFS: fstest.MapFS{
++				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("bad\n")},
++				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("\n")},
++			},
++			expectedErr:          true,
++			expectedAffinityCore: noAffinity,
++		},
++		{
++			name:   "no affinity with bad isolated set",
++			cpuset: "0-15",
++			testFS: fstest.MapFS{
++				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("-1\n")},
++				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("bad\n")},
++			},
++			expectedErr:          true,
++			expectedAffinityCore: noAffinity,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			affinityCore := noAffinity
++
++			err := setCPUAffinity(tt.testFS, tt.cpuset, func(cpu uint32) {
++				affinityCore = int(cpu)
++			})
++			if err != nil && !tt.expectedErr {
++				t.Fatalf("unexpected error: %s", err)
++			} else if err == nil && tt.expectedErr {
++				t.Fatalf("unexpected success")
++			} else if tt.expectedAffinityCore != affinityCore {
++				t.Fatalf("expected affinity core %d: got %d instead", tt.expectedAffinityCore, affinityCore)
++			}
++		})
++	}
++}
++
++func TestGetEligibleCPU(t *testing.T) {
++	tests := []struct {
++		name                 string
++		cpuset               string
++		isolset              string
++		expectedErr          bool
++		expectedAffinityCore int
++		expectedEligible     bool
++	}{
++		{
++			name:             "no cpuset",
++			isolset:          "2-15,18-31,34-47",
++			expectedEligible: false,
++		},
++		{
++			name:             "no isolated set",
++			cpuset:           "0-15",
++			expectedEligible: false,
++		},
++		{
++			name:        "bad cpuset format",
++			cpuset:      "core0 to core15",
++			isolset:     "2-15,18-31,34-47",
++			expectedErr: true,
++		},
++		{
++			name:        "bad isolated set format",
++			cpuset:      "0-15",
++			isolset:     "core0 to core15",
++			expectedErr: true,
++		},
++		{
++			name:             "no eligible core",
++			cpuset:           "0-1,16-17,32-33",
++			isolset:          "2-15,18-31,34-47",
++			expectedEligible: false,
++		},
++		{
++			name:             "no eligible core inverted",
++			cpuset:           "2-15,18-31,34-47",
++			isolset:          "0-1,16-17,32-33",
++			expectedEligible: false,
++		},
++		{
++			name:                 "eligible core mixed",
++			cpuset:               "8-31",
++			isolset:              "2-15,18-31,34-47",
++			expectedEligible:     true,
++			expectedAffinityCore: 16,
++		},
++		{
++			name:                 "eligible core #4",
++			cpuset:               "4-7",
++			isolset:              "2-15,18-31,34-47",
++			expectedEligible:     true,
++			expectedAffinityCore: 4,
++		},
++		{
++			name:                 "eligible core #40",
++			cpuset:               "40-47",
++			isolset:              "2-15,18-31,34-47",
++			expectedEligible:     true,
++			expectedAffinityCore: 40,
++		},
++		{
++			name:                 "eligible core #24",
++			cpuset:               "24-31",
++			isolset:              "2-15,18-31,34-47",
++			expectedEligible:     true,
++			expectedAffinityCore: 24,
++		},
++		{
++			name:             "no eligible core small isolated set",
++			cpuset:           "60-63",
++			isolset:          "0-1",
++			expectedEligible: false,
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			affinityCore, err := getEligibleCPU(tt.cpuset, tt.isolset)
++			eligible := affinityCore >= 0
++			if err != nil && !tt.expectedErr {
++				t.Fatalf("unexpected error: %s", err)
++			} else if err == nil && tt.expectedErr {
++				t.Fatalf("unexpected success")
++			} else if tt.expectedEligible && !eligible {
++				t.Fatalf("was expecting eligible core but no eligible core returned")
++			} else if !tt.expectedEligible && eligible {
++				t.Fatalf("was not expecting eligible core but got eligible core")
++			} else if tt.expectedEligible && tt.expectedAffinityCore != affinityCore {
++				t.Fatalf("expected affinity core %d: got %d instead", tt.expectedAffinityCore, affinityCore)
++			}
++		})
++	}
++}
+diff --git a/libcontainer/message_linux.go b/libcontainer/message_linux.go
+index 6d1107e8..c1920ba2 100644
+--- a/libcontainer/message_linux.go
++++ b/libcontainer/message_linux.go
+@@ -22,6 +22,7 @@ const (
+ 	UidmapPathAttr   uint16 = 27288
+ 	GidmapPathAttr   uint16 = 27289
+ 	MountSourcesAttr uint16 = 27290
++  CPUAffinityAttr  uint16 = 27292
+ )
+ 
+ type Int32msg struct {
+diff --git a/libcontainer/nsenter/nsexec.c b/libcontainer/nsenter/nsexec.c
+index 2d224bab..18280e59 100644
+--- a/libcontainer/nsenter/nsexec.c
++++ b/libcontainer/nsenter/nsexec.c
+@@ -94,6 +94,9 @@ struct nlconfig_t {
+ 	/* Mount sources opened outside the container userns. */
+ 	char *mountsources;
+ 	size_t mountsources_len;
++  /* Temporary CPU affinity before cgroup cpuset transition. */
++  uint32_t cpu_affinity;
++
+ };
+ 
+ /*
+@@ -127,7 +130,7 @@ static int loglevel = DEBUG;
+ #define UIDMAPPATH_ATTR		27288
+ #define GIDMAPPATH_ATTR		27289
+ #define MOUNT_SOURCES_ATTR	27290
+-
++#define CPU_AFFINITY_ATTR 27292
+ /*
+  * Use the raw syscall for versions of glibc which don't include a function for
+  * it, namely (glibc 2.12).
+@@ -506,6 +509,9 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+ 	if (len != size)
+ 		bail("failed to read netlink payload, %zu != %zu", len, size);
+ 
++	/* No cpu affinity by default: int32(-1) */
++	config->cpu_affinity = ~0;
++
+ 	/* Parse the netlink payload. */
+ 	config->data = data;
+ 	while (current < data + size) {
+@@ -554,10 +560,12 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+ 			config->mountsources = current;
+ 			config->mountsources_len = payload_len;
+ 			break;
++    case CPU_AFFINITY_ATTR:
++      config->cpu_affinity = readint32(current);
++      break;
+ 		default:
+ 			bail("unknown netlink message type %d", nlattr->nla_type);
+ 		}
+-
+ 		current += NLA_ALIGN(payload_len);
+ 	}
+ }
+@@ -1265,6 +1273,29 @@ void nsexec(void)
+ 				}
+ 			}
+ 
++			/*
++			 * Set temporary single CPU affinity before cgroup cpuset transition,
++			 * this handles a corner case when joining a container having all
++			 * the processes running exclusively on isolated CPU cores to force
++			 * the kernel to schedule runc process on the first CPU core within the
++			 * cgroups cpuset. The introduction of the kernel commit
++			 * 46a87b3851f0d6eb05e6d83d5c5a30df0eca8f76 has affected this deterministic
++			 * scheduling behavior by distributing tasks across CPU cores within the
++			 * cgroups cpuset. Some intensive real-time application are relying on this
++			 * deterministic behavior and use the first CPU core to run a slow thread
++			 * while other CPU cores are fully used by real-time threads with SCHED_FIFO
++			 * policy. Such applications prevent runc process from joining a container
++			 * when the runc process is randomly scheduled on a CPU core owned by a
++			 * real-time thread.
++			 */
++			if ((int32_t) config.cpu_affinity >= 0) {
++				cpu_set_t set;
++				CPU_ZERO(&set);
++				CPU_SET(config.cpu_affinity, &set);
++				if (sched_setaffinity(0, sizeof(set), &set) == -1)
++					bail("sched_setaffinity failed");
++			}
++
+ 			/*
+ 			 * TODO: What about non-namespace clone flags that we're dropping here?
+ 			 *
+-- 
+2.25.1
+
