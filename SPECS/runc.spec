@@ -20,28 +20,29 @@ go build -buildmode pie -compiler gc -tags="rpm_crashtraceback libtrust_openssl 
 %global import_path %{provider}.%{provider_tld}/%{project}/%{repo}
 %global git0 https://%{import_path}
 
-Epoch: 1
-Name: %{repo}
-Version: 1.1.8
-Release: 0%{?dist}
-Summary: CLI for running Open Containers
+Epoch:                1
+Name:                 %{repo}
+Version:              1.1.12
+Release:              1%{?dist}
+Summary:              CLI for running Open Containers
 # https://fedoraproject.org/wiki/PackagingDrafts/Go#Go_Language_Architectures
 #ExclusiveArch: %%{go_arches}
 # still use arch exclude as the macro above still refers %%{ix86} in RHEL8.4:
 # https://bugzilla.redhat.com/show_bug.cgi?id=1905383
-ExcludeArch: %{ix86}
-License: ASL 2.0
-URL: %{git0}
-Source0: %{git0}/archive/v%{version}.tar.gz
-Provides: oci-runtime
-BuildRequires: golang >= 1.17.7
-BuildRequires: git
-BuildRequires: /usr/bin/go-md2man
-BuildRequires: libseccomp-devel >= 2.5
-Requires: libseccomp >= 2.5
-Requires: criu
+ExcludeArch:          %{ix86}
+License:              ASL 2.0
+URL:                  %{git0}
+Source0:              %{git0}/archive/v%{version}.tar.gz
+Provides:             oci-runtime
+BuildRequires:        golang >= 1.20.6
+BuildRequires:        git
+BuildRequires:        /usr/bin/go-md2man
+BuildRequires:        libseccomp-devel >= 2.5
+Requires:             libseccomp >= 2.5
+Requires:             criu
 
-Patch0: 0001-Set-temp-single-CPU-affinity.patch
+Patch1:               0001-Set-temp-single-CPU-affinity.patch
+Patch2:               CVE-2024-21626.patch
 
 %description
 The runc command can be used to start containers which are packaged
@@ -49,7 +50,6 @@ in accordance with the Open Container Initiative's specifications,
 and to manage containers running under runc.
 
 %prep
-
 %autosetup -Sgit
 sed -i '/\#\!\/bin\/bash/d' contrib/completions/bash/%{name}
 
@@ -88,8 +88,51 @@ make install install-man install-bash DESTDIR=$RPM_BUILD_ROOT PREFIX=%{_prefix} 
 %{_datadir}/bash-completion/completions/%{name}
 
 %changelog
-* Fri Jul 21 2023 Skip Grube <sgrube@ciq.com> - 1:1.1.8-0
-- Rebasing to 1.1.8 , with CPU affinity patch to try and solve realtime kernel issue
+* Fri May 10 2024 Matthew Hink <mhink@ciq.com> <> - 1.1.12-1
+- Rebase to 1.18 with affinity CPU patch
+- CVE-2024-21626
+
+* Thu Feb 01 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.12
+- fixes CVE-2024-21626
+- Resolves: RHEL-23587
+
+* Tue Jan 23 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.9-3
+- Make the module buildable again
+- Resolves: RHEL-16299
+
+* Mon Dec 04 2023 Lokesh Mandvekar <lsm5@redhat.com> - 1:1.1.9-2
+- Rebuild with golang 1.20.10 for CVE-2023-39321
+- Related: Jira:RHEL-4516
+
+* Fri Aug 11 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.9-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.9
+- Related: #2176055
+
+* Fri Jul 21 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.8-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.8
+- Related: #2176055
+
+* Fri Jun 16 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.7-2
+- rebuild for following CVEs:
+CVE-2022-41724
+- Resolves: #2179972
+
+* Wed May 03 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.7-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.7
+- Related: #2176055
+
+* Wed Apr 12 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.6-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.6
+- Related: #2176055
+
+* Fri Mar 31 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.5-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.5
+- Related: #2176055
+
+* Thu Mar 09 2023 Jindrich Novy <jnovy@redhat.com> - 1:1.1.4-2
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.4
+- Related: #2176055
 
 * Fri Aug 26 2022 Jindrich Novy <jnovy@redhat.com> - 1:1.1.4-1
 - update to https://github.com/opencontainers/runc/releases/tag/v1.1.4
