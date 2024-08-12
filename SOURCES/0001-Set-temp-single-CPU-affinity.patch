@@ -22,9 +22,8 @@ policy. Such applications prevents runc process from joining a container
 when the runc process is randomly scheduled on a CPU core owned by a
 real-time thread.
 
-This patch has been adapted to runc-1.1.8 by Skip Grube and Matt Hink (sgrube@ciq.com , mhink@ciq.com)
-
 Signed-off-by: Cédric Clerget <cedric.clerget@gmail.com>
+Signed-off-by: Neil Hanlon <nhanlon@ciq.com>
 ---
  libcontainer/container_linux.go      | 136 ++++++++++++++++++++++
  libcontainer/container_linux_test.go | 168 +++++++++++++++++++++++++++
@@ -33,7 +32,7 @@ Signed-off-by: Cédric Clerget <cedric.clerget@gmail.com>
  4 files changed, 338 insertions(+), 2 deletions(-)
 
 diff --git a/libcontainer/container_linux.go b/libcontainer/container_linux.go
-index 5f1a494b..059c3d79 100644
+index 40b332f9..3e0e1fcf 100644
 --- a/libcontainer/container_linux.go
 +++ b/libcontainer/container_linux.go
 @@ -6,6 +6,7 @@ import (
@@ -52,7 +51,7 @@ index 5f1a494b..059c3d79 100644
  	"github.com/opencontainers/runc/libcontainer/configs"
  	"github.com/opencontainers/runc/libcontainer/intelrdt"
  	"github.com/opencontainers/runc/libcontainer/system"
-@@ -2238,6 +2240,24 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
+@@ -2247,6 +2249,24 @@ func (c *linuxContainer) bootstrapData(cloneFlags uintptr, nsMaps map[configs.Na
  		})
  	}
  
@@ -77,48 +76,28 @@ index 5f1a494b..059c3d79 100644
  	return bytes.NewReader(r.Serialize()), nil
  }
  
-@@ -2272,3 +2292,119 @@ func requiresRootOrMappingTool(c *configs.Config) bool {
+@@ -2281,3 +2301,99 @@ func requiresRootOrMappingTool(c *configs.Config) bool {
  	}
  	return !reflect.DeepEqual(c.GidMappings, gidMap)
  }
 +
 +// setCPUAffinity adjusts the CPU affinity if necessary based on heuristics.
 +func setCPUAffinity(fsys fs.FS, cpusetList string, setFn func(uint32)) error {
-+	schedRuntimeData, err := fs.ReadFile(fsys, "proc/sys/kernel/sched_rt_runtime_us")
-+	if err != nil || len(schedRuntimeData) == 0 {
-+		return nil
-+	}
-+	schedRuntime, err := strconv.ParseInt(string(bytes.TrimSpace(schedRuntimeData)), 10, 64)
-+	if err != nil {
-+		return err
-+	}
-+
-+	// When set to -1, it gives zero room for kernel to switch in kernel space on
-+	// a CPU where a real-time application is running on under scheduler real-time
-+	// policies and do not make any context switch.
-+	// With this setting value and because the kernel randomly dispatch runc process
-+	// on one of CPUs, runc can get stuck under some conditions during cgroup
-+	// transition when many tasks within a cgroup cpuset are running under a scheduler
-+	// real-time policy and on isolated CPUs.
-+	// The call to getEligibleCPU below returns a predictable CPU affinity to circumvent
-+	// this kernel random dispatching when isolated CPUs are present in the cpuset.
-+	if schedRuntime != -1 {
-+		return nil
-+	}
-+
-+	// get the isolated CPU list
-+	isolatedData, err := fs.ReadFile(fsys, "sys/devices/system/cpu/isolated")
++	// Get the isolated CPU list, the error is not checked here because
++	// no matter what the error is, it returns without error the same way
++	// as with empty data.
++	isolatedData, _ := fs.ReadFile(fsys, "sys/devices/system/cpu/nohz_full")
++	isolatedList := string(bytes.TrimSpace(isolatedData))
 +	// The above file may not be available in some environment
 +	// due to /sys not being mounted, if not present we don't
-+	// try to set CPU affinity and ignore the error.
-+	// When an empty set is returned, the data length is equal
-+	// to 1 (newline char), when set its length is greater than 1
-+	// which means we may need to adjust CPU affinity shortly.
-+	if err != nil || len(isolatedData) == 0 {
++	// try to set CPU affinity and ignore the error, also
++	// ignore empty set and (null) value.
++	if isolatedList == "" || isolatedList == "(null)" {
 +		return nil
 +	}
 +
-+	cpu, err := getEligibleCPU(cpusetList, string(bytes.TrimSpace(isolatedData)))
++	// Find a potential eligible CPU to adjust CPU affinity.
++	cpu, err := getEligibleCPU(cpusetList, isolatedList)
 +	if err != nil {
 +		return fmt.Errorf("getting eligible cpu: %w", err)
 +	} else if cpu >= 0 && setFn != nil {
@@ -198,7 +177,7 @@ index 5f1a494b..059c3d79 100644
 +	return eligibleCore, nil
 +}
 diff --git a/libcontainer/container_linux_test.go b/libcontainer/container_linux_test.go
-index 3eb6e5af..8ede3795 100644
+index 27eee624..f44e1666 100644
 --- a/libcontainer/container_linux_test.go
 +++ b/libcontainer/container_linux_test.go
 @@ -2,8 +2,10 @@ package libcontainer
@@ -212,7 +191,7 @@ index 3eb6e5af..8ede3795 100644
  
  	"github.com/opencontainers/runc/libcontainer/cgroups"
  	"github.com/opencontainers/runc/libcontainer/configs"
-@@ -390,3 +392,169 @@ func TestGetContainerStateAfterUpdate(t *testing.T) {
+@@ -286,3 +288,170 @@ func TestGetContainerStateAfterUpdate(t *testing.T) {
  		t.Fatalf("expected Memory to be 2048 but received %q", state.Config.Cgroups.Memory)
  	}
  }
@@ -231,36 +210,37 @@ index 3eb6e5af..8ede3795 100644
 +			name:   "no affinity",
 +			cpuset: "0-15",
 +			testFS: fstest.MapFS{
-+				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("950000\n")},
-+				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("0-4\n")},
++				"sys/devices/system/cpu/nohz_full": &fstest.MapFile{Data: []byte("16-20\n")},
 +			},
++			expectedAffinityCore: noAffinity,
++		},
++		{
++			name:                 "no affinity without nohz_full",
++			cpuset:               "0-15",
++			testFS:               fstest.MapFS{},
 +			expectedAffinityCore: noAffinity,
 +		},
 +		{
 +			name:   "affinity match",
 +			cpuset: "3-4",
 +			testFS: fstest.MapFS{
-+				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("-1\n")},
-+				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("0-4\n")},
++				"sys/devices/system/cpu/nohz_full": &fstest.MapFile{Data: []byte("0-4\n")},
 +			},
 +			expectedAffinityCore: 3,
 +		},
 +		{
-+			name:   "no affinity with bad sched_rt_runtime_us",
++			name:   "no affinity with (null) nohz_full set",
 +			cpuset: "0-15",
 +			testFS: fstest.MapFS{
-+				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("bad\n")},
-+				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("\n")},
++				"sys/devices/system/cpu/nohz_full": &fstest.MapFile{Data: []byte("(null)\n")},
 +			},
-+			expectedErr:          true,
 +			expectedAffinityCore: noAffinity,
 +		},
 +		{
-+			name:   "no affinity with bad isolated set",
++			name:   "no affinity with bad nohz_full set",
 +			cpuset: "0-15",
 +			testFS: fstest.MapFS{
-+				"proc/sys/kernel/sched_rt_runtime_us": &fstest.MapFile{Data: []byte("-1\n")},
-+				"sys/devices/system/cpu/isolated":     &fstest.MapFile{Data: []byte("bad\n")},
++				"sys/devices/system/cpu/nohz_full": &fstest.MapFile{Data: []byte("bad\n")},
 +			},
 +			expectedErr:          true,
 +			expectedAffinityCore: noAffinity,
@@ -383,32 +363,31 @@ index 3eb6e5af..8ede3795 100644
 +	}
 +}
 diff --git a/libcontainer/message_linux.go b/libcontainer/message_linux.go
-index 6d1107e8..c1920ba2 100644
+index 6d1107e8..306ad567 100644
 --- a/libcontainer/message_linux.go
 +++ b/libcontainer/message_linux.go
 @@ -22,6 +22,7 @@ const (
  	UidmapPathAttr   uint16 = 27288
  	GidmapPathAttr   uint16 = 27289
  	MountSourcesAttr uint16 = 27290
-+  CPUAffinityAttr  uint16 = 27292
++	CPUAffinityAttr  uint16 = 27292
  )
  
  type Int32msg struct {
 diff --git a/libcontainer/nsenter/nsexec.c b/libcontainer/nsenter/nsexec.c
-index 2d224bab..18280e59 100644
+index 2d224bab..c29f9439 100644
 --- a/libcontainer/nsenter/nsexec.c
 +++ b/libcontainer/nsenter/nsexec.c
-@@ -94,6 +94,9 @@ struct nlconfig_t {
+@@ -94,6 +94,8 @@ struct nlconfig_t {
  	/* Mount sources opened outside the container userns. */
  	char *mountsources;
  	size_t mountsources_len;
-+  /* Temporary CPU affinity before cgroup cpuset transition. */
-+  uint32_t cpu_affinity;
-+
++	/* Temporary CPU affinity before cgroup cpuset transition. */
++	uint32_t cpu_affinity;
  };
  
  /*
-@@ -127,7 +130,7 @@ static int loglevel = DEBUG;
+@@ -127,7 +129,7 @@ static int loglevel = DEBUG;
  #define UIDMAPPATH_ATTR		27288
  #define GIDMAPPATH_ATTR		27289
  #define MOUNT_SOURCES_ATTR	27290
@@ -417,7 +396,7 @@ index 2d224bab..18280e59 100644
  /*
   * Use the raw syscall for versions of glibc which don't include a function for
   * it, namely (glibc 2.12).
-@@ -506,6 +509,9 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+@@ -506,6 +508,9 @@ static void nl_parse(int fd, struct nlconfig_t *config)
  	if (len != size)
  		bail("failed to read netlink payload, %zu != %zu", len, size);
  
@@ -427,13 +406,13 @@ index 2d224bab..18280e59 100644
  	/* Parse the netlink payload. */
  	config->data = data;
  	while (current < data + size) {
-@@ -554,10 +560,12 @@ static void nl_parse(int fd, struct nlconfig_t *config)
+@@ -554,10 +559,12 @@ static void nl_parse(int fd, struct nlconfig_t *config)
  			config->mountsources = current;
  			config->mountsources_len = payload_len;
  			break;
-+    case CPU_AFFINITY_ATTR:
-+      config->cpu_affinity = readint32(current);
-+      break;
++		case CPU_AFFINITY_ATTR:
++			config->cpu_affinity = readint32(current);
++			break;
  		default:
  			bail("unknown netlink message type %d", nlattr->nla_type);
  		}
@@ -441,7 +420,7 @@ index 2d224bab..18280e59 100644
  		current += NLA_ALIGN(payload_len);
  	}
  }
-@@ -1265,6 +1273,29 @@ void nsexec(void)
+@@ -1265,6 +1272,29 @@ void nsexec(void)
  				}
  			}
  
