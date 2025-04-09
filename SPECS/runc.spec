@@ -23,7 +23,7 @@ go build -buildmode pie -compiler gc -tags="rpm_crashtraceback libtrust_openssl 
 Epoch:                1
 Name:                 %{repo}
 Version:              1.1.12
-Release:              1%{?dist}
+Release:              6%{?dist}
 Summary:              CLI for running Open Containers
 # https://fedoraproject.org/wiki/PackagingDrafts/Go#Go_Language_Architectures
 #ExclusiveArch: %%{go_arches}
@@ -33,18 +33,17 @@ ExcludeArch:          %{ix86}
 License:              ASL 2.0
 URL:                  %{git0}
 Source0:              %{git0}/archive/v%{version}.tar.gz
+Patch0:               0001-1.1-Bump-runtime-spec-to-latest-git-HEAD.patch
+Patch1:               0002-1.1-runc-exec-implement-CPU-affinity.patch
 Provides:             oci-runtime
-BuildRequires:        golang >= 1.17.7
+BuildRequires:        golang >= 1.21.4
 BuildRequires:        git
 BuildRequires:        /usr/bin/go-md2man
 BuildRequires:        libseccomp-devel >= 2.5
-BuildRequires:        container-selinux >= 2.224.0
 Requires:             libseccomp >= 2.5
 Requires:             criu
-Requires:             container-selinux >= 2.224.0
-
-Patch1:               0001-Set-temp-single-CPU-affinity.patch
-Patch2:               CVE-2024-21626.patch
+Patch2:               0001-Set-temp-single-CPU-affinity.patch
+Patch3:               CVE-2024-21626.patch
 
 %description
 The runc command can be used to start containers which are packaged
@@ -66,7 +65,7 @@ pushd GOPATH/src/%{import_path}
 export GO111MODULE=off
 export GOPATH=%{gopath}:$(pwd)/GOPATH
 export CGO_CFLAGS="%{optflags} -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64"
-export BUILDTAGS="selinux seccomp runc_dmz_selinux_nocompat"
+export BUILDTAGS="selinux seccomp no_openssl"
 export LDFLAGS="-X main.gitCommit= -X main.version=%{version}"
 %gobuild -o %{name} %{import_path}
 
@@ -90,9 +89,30 @@ make install install-man install-bash DESTDIR=$RPM_BUILD_ROOT PREFIX=%{_prefix} 
 %{_datadir}/bash-completion/completions/%{name}
 
 %changelog
-* Mon Aug 12 2024 Matthew Hink <mhink@ciq.com> <> - 1.1.12-1
+* Tue Apr 08 2025 Matthew Hink <mhink@ciq.com> <> - 1.1.12-6
 - Rebase to 1.12 with affinity CPU patch
 - CVE-2024-21626
+
+* Mon Jan 20 2025 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-6
+- Add CPU affinity feature from Kir Kolishkin
+- Resolves: RHEL-74865
+
+* Tue Oct 01 2024 Kir Kolyshkin <kir@redhat.com> - 1:1.1.12-5
+- bump golang buildrequires
+- add no_openssl build tag
+- Resolves RHEL-55757
+
+* Mon Aug 05 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-4
+- rebuild for  golang fixes
+- Related: RHEL-28452
+
+* Thu Aug 01 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-3
+- rebuild for  golang fixes
+- Related: RHEL-28452
+
+* Fri Jun 21 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-2
+- rebuild for CVE-2024-1394
+- Resolves: RHEL-24297
 
 * Thu Feb 01 2024 Jindrich Novy <jnovy@redhat.com> - 1:1.1.12-1
 - update to https://github.com/opencontainers/runc/releases/tag/v1.1.12
