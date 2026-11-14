@@ -19,8 +19,8 @@ go build -buildmode pie -compiler gc -tags="rpm_crashtraceback libtrust_openssl 
 
 Epoch: 4
 Name: %{repo}
-Version: 1.1.12
-Release: 1%{?dist}
+Version: 1.2.9
+Release: 1.1%{?dist}
 Summary: CLI for running Open Containers
 # https://fedoraproject.org/wiki/PackagingDrafts/Go#Go_Language_Architectures
 #ExclusiveArch: %%{go_arches}
@@ -31,12 +31,14 @@ License: ASL 2.0
 URL: %{git0}
 Source0: %{git0}/archive/v%{version}.tar.gz
 Provides: oci-runtime
-BuildRequires: golang >= 1.20.10
+BuildRequires: golang >= 1.22.4
 BuildRequires: git
 BuildRequires: /usr/bin/go-md2man
 BuildRequires: libseccomp-devel >= 2.5
+BuildRequires: container-selinux
 Requires: libseccomp >= 2.5
-Requires: criu
+Recommends: criu
+Requires: container-selinux
 
 %description
 The runc command can be used to start containers which are packaged
@@ -56,9 +58,9 @@ popd
 
 pushd GOPATH/src/%{import_path}
 export GO111MODULE=off
-export GOPATH=%{gopath}:$(pwd)/GOPATH
+export GOPATH=%{_builddir}/%{name}-%{version}/GOPATH:%{gopath}
 export CGO_CFLAGS="%{optflags} -D_GNU_SOURCE -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64"
-export BUILDTAGS="selinux seccomp"
+export BUILDTAGS="selinux seccomp runc_dmz_selinux_nocompat no_openssl"
 export LDFLAGS="-X main.gitCommit= -X main.version=%{version}"
 %gobuild -o %{name} %{import_path}
 
@@ -82,15 +84,106 @@ make install install-man install-bash DESTDIR=$RPM_BUILD_ROOT PREFIX=%{_prefix} 
 %{_datadir}/bash-completion/completions/%{name}
 
 %changelog
+* Sat Nov 14 2026 Jeff Uphoff <juphoff@ciq.com> - 4:1.2.9-1.1
+- Update to https://github.com/opencontainers/runc/releases/tag/v1.2.9
+  (packaging from RHEL 9 runc-1.2.5-3 with the RHEL 8.10 runc-1.2.9-9
+  changes: no patches needed, absolute GOPATH), matching Red Hat's
+  RHEL 9.2 fix runc-1.2.9-1.el9_2.1 (RHSA-2026:4531)
+- Fixes CVE-2025-31133 CVE-2025-52565 CVE-2025-52881
+- Fixes CVE-2025-65637 (vendored github.com/sirupsen/logrus is now v1.9.3)
+- Fixes CVE-2024-45310 (fixed upstream in runc 1.1.14)
+- Fixes CVE-2024-24783 CVE-2024-24790 CVE-2024-45341 CVE-2025-47906
+  CVE-2025-58185 CVE-2025-58188 CVE-2025-58189 CVE-2025-61723 (Go standard
+  library, statically linked; built with golang 1.25.9, the shipped 1.1.12
+  build used go1.20.10)
+- Fixes CVE-2024-1394 CVE-2024-9355 (Go FIPS OpenSSL backend: now
+  github.com/golang-fips/openssl/v2 from golang 1.25.9 instead of the old
+  openssl-fips backend)
+- Relax container-selinux >= 2.224.0 to an unversioned dependency: the
+  minimum was added in 1.1.10-2 for runc-dmz, which upstream dropped in
+  runc 1.2.1; LTS 9.2 ships container-selinux 2.205.0
+
+* Fri Jun 26 2026 Jason Rodriguez <jrodriguez@ciq.com> - 4:1.1.12-1.1
+- Rebuild against golang 1.25.9 to remediate CVE-2025-61726 and CVE-2026-25679 (Go net/url stdlib, statically linked into the binaries)
+
+* Wed Nov 05 2025 Jindrich Novy <jnovy@redhat.com> - 4:1.2.5-3
+- Add relevant patches to CVEs
+- Resolves: RHEL-122402
+
+* Fri Oct 31 2025 Jindrich Novy <jnovy@redhat.com> - 4:1.2.5-2
+- fix CVE-2025-31133 CVE-2025-52565 CVE-2025-52881
+- Resolves: RHEL-122402
+- Resolves: RHEL-122404
+- Resolves: RHEL-122415
+
+* Tue Feb 18 2025 Jindrich Novy <jnovy@redhat.com> - 4:1.2.5-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.2.5
+- Related: RHEL-60277
+
+* Fri Jan 24 2025 Jindrich Novy <jnovy@redhat.com> - 4:1.2.4-2
+- Implement CPU affinity patch from Kir Kolishkin
+- Related: RHEL-60277
+
+* Fri Jan 10 2025 Jindrich Novy <jnovy@redhat.com> - 4:1.2.4-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.2.4
+- Related: RHEL-60277
+
+* Wed Dec 11 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.2.3-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.2.3
+- Related: RHEL-60277
+
+* Wed Nov 27 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.2.2-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.2.2
+- Resolves: RHEL-69142
+
+* Tue Oct 08 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.15-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.15
+- Related: RHEL-61725
+
+* Wed Sep 04 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.14-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.14
+- Related: RHEL-27608
+
+* Mon Jul 15 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.13-4
+- rebuild against new golang
+- Resolves: RHEL-46380
+
+* Fri Jul 12 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.13-3
+- rebuild against golang-1.22.4
+- Resolves: RHEL-46380
+
+* Mon Jul 08 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.13-2
+- rebuild
+- Resolves: RHEL-46380
+
+* Fri Jun 14 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.13-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.13
+- Related: RHEL-27608
+
+* Fri Feb 16 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.12-2
+- Switch dependency on criu to Recommends
+- Resolves: RHEL-25116
+
 * Thu Feb 01 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.12-1
 - update to https://github.com/opencontainers/runc/releases/tag/v1.1.12
-- fixes CVE-2024-21626
-- Resolves: RHEL-23596
+- Related: RHEL-2112
 
-* Sat Dec 02 2023 Lokesh Mandvekar <lsm5@redhat.com> - 4:1.1.9-2
+* Tue Jan 02 2024 Jindrich Novy <jnovy@redhat.com> - 4:1.1.11-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.11
+- Related: RHEL-2112
+
+* Sat Dec 02 2023 Lokesh Mandvekar <lsm5@redhat.com> - 4:1.1.10-3
 - Rebuild for CVEs: CVE-2023-39321 CVE-2023-39322 CVE-2023-29409
 - Related: Jira:RHEL-2792
 - Related: Jira:RHEL-7454
+
+* Fri Nov 03 2023 Jindrich Novy <jnovy@redhat.com> - 4:1.1.10-2
+- require container-selinux >= 2.224.0 for dmz feature
+- Related: Jira:RHEL-2112
+
+* Wed Nov 01 2023 Jindrich Novy <jnovy@redhat.com> - 4:1.1.10-1
+- update to https://github.com/opencontainers/runc/releases/tag/v1.1.10
+- Related: RHEL-2112
 
 * Fri Aug 11 2023 Jindrich Novy <jnovy@redhat.com> - 4:1.1.9-1
 - update to https://github.com/opencontainers/runc/releases/tag/v1.1.9
